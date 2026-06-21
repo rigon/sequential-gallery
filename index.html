@@ -993,6 +993,7 @@
   function clearAll(skipResetInput) {
     halted = true;
     imgs = [];
+    lbIdx = 0;
     document.getElementById('gallery').innerHTML = `
       <div class="empty">
         <svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -1094,6 +1095,13 @@
 
     if (e.key === 'Enter' && document.activeElement === urlInput) startLoad();
     if (e.key === 'Escape') hideHistDrop();
+
+    // Arrow keys navigate history; Enter opens lightbox — when input is not focused
+    if (document.activeElement !== urlInput) {
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); navHist(-1); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); navHist(1); }
+      if (e.key === 'Enter' && imgs.length > 0) { e.preventDefault(); openLb(lbIdx < imgs.length ? lbIdx : 0); }
+    }
   });
 
   document.getElementById('lb').addEventListener('click', e => {
