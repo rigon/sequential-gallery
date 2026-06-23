@@ -671,7 +671,6 @@
 
   /* ── history (localStorage) ── */
   const HIST_KEY = 'seq-gallery-history';
-  const HIST_MAX = 30;
 
   function loadHistory() {
     try { return JSON.parse(localStorage.getItem(HIST_KEY)) || []; }
@@ -682,7 +681,6 @@
     let hist = loadHistory();
     hist = hist.filter(h => h.url !== entry.url); // remove dupe
     hist.unshift(entry);
-    if (hist.length > HIST_MAX) hist = hist.slice(0, HIST_MAX);
     localStorage.setItem(HIST_KEY, JSON.stringify(hist));
   }
 
