@@ -669,28 +669,126 @@
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  /* ── history (localStorage) ── */
-  const HIST_KEY = 'seq-gallery-history';
+  /* ── history (localStorage) + thumbnails (IndexedDB) ── */
+  const HIST_KEY  = 'seq-gallery-history';   // lean metadata only
+  const IDB_NAME  = 'seq-gallery';
+  const IDB_STORE = 'thumbs';                // keyed by url → Blob (or remote-url string fallback)
+
+  // thumbnail render target (small JPEG, aiming ~3–5 KB each)
+  const THUMB_W   = 108;          // 2× the 54px display box for crisp HiDPI
+  const THUMB_H   = 80;           // 2× the 40px display box
+  const THUMB_MAXBYTES = 5 * 1024;
 
   function loadHistory() {
     try { return JSON.parse(localStorage.getItem(HIST_KEY)) || []; }
     catch(e) { return []; }
   }
 
-  function saveToHistory(entry) {
+  /* ── IndexedDB thumbnail store ── */
+  let _idbPromise = null;
+  function idb() {
+    if (_idbPromise) return _idbPromise;
+    _idbPromise = new Promise((resolve, reject) => {
+      let req;
+      try { req = indexedDB.open(IDB_NAME, 1); }
+      catch (e) { reject(e); return; }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error);
+    });
+    return _idbPromise;
+  }
+
+  // run one transaction; resolves with the request result (undefined for writes)
+  async function idbRun(mode, fn) {
+    try {
+      const db = await idb();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, mode);
+        const store = tx.objectStore(IDB_STORE);
+        let out;
+        const r = fn(store);
+        if (r) r.onsuccess = () => { out = r.result; };
+        tx.oncomplete = () => resolve(out);
+        tx.onerror    = () => reject(tx.error);
+        tx.onabort    = () => reject(tx.error);
+      });
+    } catch (e) {
+      return undefined;   // IndexedDB unavailable (e.g. private mode) — degrade silently
+    }
+  }
+
+  const idbGetThumb  = url        => idbRun('readonly',  s => s.get(url));
+  const idbPutThumb  = (url, val) => idbRun('readwrite', s => s.put(val, url));
+  const idbDelThumb  = url        => idbRun('readwrite', s => s.delete(url));
+  const idbAllKeys   = ()         => idbRun('readonly',  s => s.getAllKeys());
+  const idbClear     = ()         => idbRun('readwrite', s => s.clear());
+
+  // Render the first image into a small JPEG Blob.
+  // Returns null if the image can't be drawn to a canvas — e.g. the host
+  // sends no CORS headers, which taints the canvas and blocks export.
+  function makeThumb(src) {
+    const toBlob = (cv, q) => new Promise(r => cv.toBlob(r, 'image/jpeg', q));
+    return new Promise(resolve => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      let done = false;
+      const finish = v => { if (!done) { done = true; resolve(v); } };
+      const timer = setTimeout(() => finish(null), 8000);
+
+      img.onload = async () => {
+        clearTimeout(timer);
+        try {
+          const cv = document.createElement('canvas');
+          cv.width = THUMB_W; cv.height = THUMB_H;
+          const ctx = cv.getContext('2d');
+          // object-fit: cover — scale to fill, crop the overflow, centered
+          const scale = Math.max(THUMB_W / img.width, THUMB_H / img.height);
+          const dw = img.width * scale, dh = img.height * scale;
+          ctx.drawImage(img, (THUMB_W - dw) / 2, (THUMB_H - dh) / 2, dw, dh);
+
+          // step quality down until the blob fits the byte budget (or hits the floor)
+          let q = 0.6, blob = await toBlob(cv, q);
+          while (blob && blob.size > THUMB_MAXBYTES && q > 0.35) {
+            q -= 0.1;
+            blob = await toBlob(cv, q);
+          }
+          finish(blob || null);
+        } catch (e) {
+          finish(null);   // tainted canvas / SecurityError
+        }
+      };
+      img.onerror = () => { clearTimeout(timer); finish(null); };
+      img.src = src;
+    });
+  }
+
+  // entry = lean metadata (no image bytes); thumb = Blob (or remote-url string fallback)
+  async function saveToHistory(entry, thumb) {
     let hist = loadHistory();
     hist = hist.filter(h => h.url !== entry.url); // remove dupe
     hist.unshift(entry);
     localStorage.setItem(HIST_KEY, JSON.stringify(hist));
+
+    // thumbnails live in IndexedDB, pruned to the urls still in history
+    if (thumb) await idbPutThumb(entry.url, thumb);
+    const keep = new Set(hist.map(h => h.url));
+    const keys = (await idbAllKeys()) || [];
+    await Promise.all(keys.filter(k => !keep.has(k)).map(idbDelThumb));
   }
 
   function removeFromHistory(url) {
     const hist = loadHistory().filter(h => h.url !== url);
     localStorage.setItem(HIST_KEY, JSON.stringify(hist));
+    idbDelThumb(url);   // fire-and-forget; the row is already gone from the list
   }
 
   function clearHistory() {
     localStorage.removeItem(HIST_KEY);
+    idbClear();
     histPos = -1;
     updateHistNav();
     hideHistDrop();
@@ -776,11 +874,13 @@
       return;
     }
 
+    const token = ++_renderToken;
+    revokeThumbURLs();
     drop.innerHTML =
       _filteredHist.map((h, i) => `
         <div class="hist-item" data-idx="${i}">
           ${h.thumbnail
-            ? `<img class="hist-thumb" src="${escHtml(h.thumbnail)}" alt="">`
+            ? `<img class="hist-thumb" src="${escHtml(h.thumbnail)}" alt="" loading="lazy">`
             : `<div class="hist-thumb-ph">▪</div>`}
           <span class="hist-url" title="${escHtml(h.url)}">${escHtml(h.url)}</span>
           <span class="hist-meta">
@@ -811,6 +911,39 @@
     drop.querySelectorAll('.hist-item').forEach(el => {
       el.addEventListener('click', () => gotoHist(+el.dataset.idx));
     });
+
+    fillThumbs(token);
+  }
+
+  // module-level thumbnail render state
+  let _thumbURLs = [];   // object URLs created for the current render
+  let _renderToken = 0;  // bumped on every render/hide so stale async fills bail
+
+  function revokeThumbURLs() {
+    _thumbURLs.forEach(u => URL.revokeObjectURL(u));
+    _thumbURLs = [];
+  }
+
+  // Pull thumbnails from IndexedDB and slot them in once the list is shown.
+  async function fillThumbs(token) {
+    for (let i = 0; i < _filteredHist.length; i++) {
+      const h = _filteredHist[i];
+      if (h.thumbnail) continue;                  // legacy inline thumbnail already shown
+      const val = await idbGetThumb(h.url);
+      if (token !== _renderToken) return;         // a newer render (or a hide) superseded us
+      if (!val) continue;
+      const item = histDrop.querySelector(`.hist-item[data-idx="${i}"]`);
+      const ph   = item && item.querySelector('.hist-thumb-ph');
+      if (!ph) continue;
+      const src = (val instanceof Blob) ? URL.createObjectURL(val) : val;
+      if (val instanceof Blob) _thumbURLs.push(src);
+      const img = document.createElement('img');
+      img.className = 'hist-thumb';
+      img.alt = '';
+      img.loading = 'lazy';
+      img.src = src;
+      ph.replaceWith(img);
+    }
   }
 
   function showHistDrop() {
@@ -822,6 +955,8 @@
   function hideHistDrop() {
     histDrop.classList.remove('open');
     histHighlightIdx = -1;
+    _renderToken++;        // invalidate any in-flight thumbnail fill
+    revokeThumbURLs();
   }
 
   function selectHistItem(entry) {
@@ -914,7 +1049,10 @@
     if (imgs.length > 0) {
       setStatus('done', `Done — ${imgs.length} image${imgs.length !== 1 ? 's' : ''} loaded`);
       if (!fromNav) {
-        saveToHistory({ url, digits, ext, startNum: startN, maxFails: maxFail, count: imgs.length, thumbnail: imgs[0].src, date: new Date().toISOString() });
+        // build a small real thumbnail (JPEG Blob → IndexedDB); fall back to the
+        // remote URL only if the image host blocks canvas export (no CORS headers)
+        const thumb = await makeThumb(imgs[0].src) || imgs[0].src;
+        await saveToHistory({ url, digits, ext, startNum: startN, maxFails: maxFail, count: imgs.length, date: new Date().toISOString() }, thumb);
         histPos = 0;
       }
       updateHistNav();
